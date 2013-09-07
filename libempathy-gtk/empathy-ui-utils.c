@@ -664,6 +664,20 @@ empathy_pixbuf_protocol_from_contact_scaled (EmpathyContact *contact,
   return pixbuf;
 }
 
+struct SendData
+{
+  GFile *file;
+  GFile *destination;
+  GCancellable *cancellable;
+  EmpathyContact *contact;
+  GtkWidget *dialog;
+  GtkProgressBar *progress;
+  GtkLabel *progress_label;
+  GtkLabel *filename_label;
+  gboolean dialog_shown;
+  gint64 last_notify;
+};
+
 void
 empathy_url_show (GtkWidget *parent,
       const char *url)
@@ -701,8 +715,8 @@ empathy_url_show (GtkWidget *parent,
   g_free (real_url);
 }
 
-void
-empathy_send_file (EmpathyContact *contact,
+static void
+send_file (EmpathyContact *contact,
     GFile *file)
 {
   EmpathyFTFactory *factory;
@@ -723,6 +737,226 @@ empathy_send_file (EmpathyContact *contact,
   g_free (uri);
 
   g_object_unref (factory);
+}
+
+static void
+send_data_free (struct SendData *send_data)
+{
+  g_clear_object (&(send_data->file));
+  g_clear_object (&(send_data->destination));
+  g_clear_object (&(send_data->contact));
+  g_clear_object (&(send_data->cancellable));
+  if (send_data->dialog != NULL)
+    gtk_widget_destroy (send_data->dialog);
+  g_free (send_data);
+}
+
+static void
+send_file_autoar_decide_dest_cb (AutoarCreate *arcreate,
+    GFile *destination,
+    struct SendData *send_data)
+{
+  send_data->destination = g_object_ref (destination);
+}
+
+static void
+send_file_autoar_dialog_response_cb (GtkDialog *dialog,
+    gint response_id,
+    struct SendData *send_data)
+{
+  if (response_id == GTK_RESPONSE_CANCEL)
+    g_cancellable_cancel (send_data->cancellable);
+}
+
+static void
+send_file_autoar_create_dialog (struct SendData *send_data)
+{
+  GtkWidget *content;
+  GtkBox *vbox;
+  char *str, *filename, *destname;
+
+  send_data->dialog = gtk_dialog_new_with_buttons (
+      _("Creating Archives…"), NULL,
+      GTK_DIALOG_DESTROY_WITH_PARENT,
+      _("Cancel"), GTK_RESPONSE_CANCEL,
+      NULL);
+  send_data->progress = GTK_PROGRESS_BAR (gtk_progress_bar_new ());
+  send_data->progress_label = GTK_LABEL (gtk_label_new (NULL));
+
+  str = g_strdup_printf ("%s -> %s",
+      filename = autoar_common_g_file_get_name (send_data->file),
+      destname = autoar_common_g_file_get_name (send_data->destination));
+  send_data->filename_label = GTK_LABEL (gtk_label_new (str));
+
+  vbox = GTK_BOX (gtk_box_new (GTK_ORIENTATION_VERTICAL, 5));
+  gtk_box_pack_start (vbox, GTK_WIDGET (send_data->filename_label),
+      FALSE, FALSE, 0);
+  gtk_box_pack_start (vbox, GTK_WIDGET (send_data->progress),
+      FALSE, FALSE, 0);
+  gtk_box_pack_start (vbox, GTK_WIDGET (send_data->progress_label),
+      FALSE, FALSE, 0);
+  content = gtk_dialog_get_content_area (GTK_DIALOG (send_data->dialog));
+  gtk_container_add (GTK_CONTAINER (content), GTK_WIDGET (vbox));
+
+  g_signal_connect (send_data->dialog, "response",
+      G_CALLBACK (send_file_autoar_dialog_response_cb), send_data);
+
+  g_free (str);
+  g_free (filename);
+  g_free (destname);
+}
+
+static void
+send_file_autoar_progress_cb (AutoarCreate *arcreate,
+    guint64 completed_size,
+    guint completed_files,
+    struct SendData *send_data)
+{
+  gint64 mtime;
+
+  DEBUG ("%s: size = %" G_GUINT64_FORMAT ", files = %u",
+     __func__, completed_size, completed_files);
+
+  mtime = g_get_monotonic_time ();
+  if (mtime - send_data->last_notify < 200000)
+    return;
+
+  send_data->last_notify = mtime;
+
+  if (!(send_data->dialog_shown))
+    {
+      if (send_data->dialog == NULL)
+        send_file_autoar_create_dialog (send_data);
+      gtk_widget_show_all (send_data->dialog);
+      send_data->dialog_shown = TRUE;
+    }
+
+  if (send_data->progress != NULL)
+    gtk_progress_bar_pulse (send_data->progress);
+
+  if (send_data->progress_label != NULL)
+    {
+      gchar *msg, *size;
+      msg = g_strdup_printf (
+          _("%u files (%s) are archived"),
+          completed_files, size = g_format_size (completed_size));
+      gtk_label_set_text (send_data->progress_label, msg);
+      g_free (msg);
+      g_free (size);
+    }
+}
+
+static void
+send_file_autoar_cancelled_cb (AutoarCreate *arcreate,
+    struct SendData *send_data)
+{
+  send_data_free (send_data);
+}
+
+static void
+send_file_autoar_completed_cb (AutoarCreate *arcreate,
+    struct SendData *send_data)
+{
+  send_file (send_data->contact, send_data->destination);
+  send_data_free (send_data);
+}
+
+static void
+send_file_autoar_error_cb (AutoarCreate *arcreate,
+    GError *error,
+    struct SendData *send_data)
+{
+  GtkWidget *error_dialog;
+  char *filename;
+
+  error_dialog = gtk_message_dialog_new_with_markup (
+      NULL, GTK_DIALOG_DESTROY_WITH_PARENT,
+      GTK_MESSAGE_ERROR, GTK_BUTTONS_CLOSE,
+      "<big><b>%s</b></big>",
+      filename = autoar_common_g_file_get_name (send_data->file));
+  gtk_message_dialog_format_secondary_text (
+      GTK_MESSAGE_DIALOG (error_dialog), "%s", error->message);
+  gtk_widget_show_all (error_dialog);
+  g_signal_connect_swapped (error_dialog, "response",
+      G_CALLBACK (gtk_widget_destroy), error_dialog);
+
+  send_data_free (send_data);
+  g_free (filename);
+}
+
+static void
+send_file_info_ready_cb (GFile *file,
+    GAsyncResult *res,
+    EmpathyContact *contact)
+{
+  GFileInfo *file_info;
+  GFileType file_type;
+
+  file_info = g_file_query_info_finish (file, res, NULL);
+  if (file_info == NULL)
+    return;
+
+  file_type = g_file_info_get_file_type (file_info);
+  g_object_unref (file_info);
+
+  if (file_type == G_FILE_TYPE_DIRECTORY)
+    {
+      struct SendData *send_data;
+      AutoarPref *arpref;
+      AutoarCreate *arcreate;
+      gchar *template;
+      GFile *archive_dir;
+      gchar *archive_dir_path;
+
+      arpref = g_object_get_data (G_OBJECT (contact), "autoar-pref");
+      template = g_strdup_printf ("empathy-%s-XXXXXX", g_get_user_name ());
+      archive_dir_path = g_dir_make_tmp (template, NULL);
+      if (archive_dir_path == NULL)
+        {
+          g_free (template);
+          return;
+        }
+
+      DEBUG ("tmpdir = %s", archive_dir_path);
+      archive_dir = g_file_new_for_path (archive_dir_path);
+      arcreate = autoar_create_new_file (arpref, archive_dir, file, NULL);
+      send_data = g_new0 (struct SendData, 1);
+      send_data->contact = g_object_ref (contact);
+      send_data->file = g_object_ref (file);
+      send_data->cancellable = g_cancellable_new ();
+      send_data->last_notify = g_get_monotonic_time ();
+
+      g_signal_connect (arcreate, "decide-dest",
+          G_CALLBACK (send_file_autoar_decide_dest_cb), send_data);
+      g_signal_connect (arcreate, "progress",
+          G_CALLBACK (send_file_autoar_progress_cb), send_data);
+      g_signal_connect (arcreate, "cancelled",
+          G_CALLBACK (send_file_autoar_cancelled_cb), send_data);
+      g_signal_connect (arcreate, "completed",
+          G_CALLBACK (send_file_autoar_completed_cb), send_data);
+      g_signal_connect (arcreate, "error",
+          G_CALLBACK (send_file_autoar_error_cb), send_data);
+      autoar_create_start_async (arcreate, send_data->cancellable);
+
+      g_free (template);
+      g_free (archive_dir_path);
+      g_object_unref (archive_dir);
+      g_object_unref (arcreate);
+    }
+  else
+    {
+      send_file (contact, file);
+    }
+}
+
+void
+empathy_send_file (EmpathyContact *contact,
+    GFile *file)
+{
+  g_file_query_info_async (file,
+      G_FILE_ATTRIBUTE_STANDARD_TYPE,
+      G_FILE_QUERY_INFO_NONE, G_PRIORITY_DEFAULT,
+      NULL, (GAsyncReadyCallback) send_file_info_ready_cb, contact);
 }
 
 void
@@ -764,10 +998,19 @@ file_manager_send_file_response_cb (GtkDialog *widget,
     EmpathyContact *contact)
 {
   GFile *file;
+  GtkWidget *format;
+  AutoarPref *arpref;
+  int arformat, arfilter;
 
   if (response_id == GTK_RESPONSE_OK || response_id == EMPATHY_RESPONSE_SEND)
     {
       file = gtk_file_chooser_get_file (GTK_FILE_CHOOSER (widget));
+
+      arpref = g_object_get_data (G_OBJECT (contact), "autoar-pref");
+      format = g_object_get_data (G_OBJECT (contact), "autoar-format");
+      autoar_gtk_format_filter_simple_get (format, &arformat, &arfilter);
+      autoar_pref_set_default_format (arpref, arformat);
+      autoar_pref_set_default_filter (arpref, arfilter);
 
       empathy_send_file (contact, file);
 
@@ -860,8 +1103,14 @@ empathy_send_file_with_file_chooser (EmpathyContact *contact)
 
   g_signal_connect (widget, "response",
       G_CALLBACK (file_manager_send_file_response_cb), g_object_ref (contact));
+  g_object_set_data_full (G_OBJECT (contact), "autoar-pref",
+      g_object_ref (arpref), g_object_unref);
+  g_object_set_data_full (G_OBJECT (contact), "autoar-format",
+      g_object_ref (format_combo), g_object_unref);
 
   gtk_widget_show (widget);
+  g_object_unref (settings);
+  g_object_unref (arpref);
 }
 
 static void
