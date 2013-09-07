@@ -36,6 +36,7 @@
 #include <gdk/gdkx.h>
 #include <glib/gi18n-lib.h>
 #include <gio/gdesktopappinfo.h>
+#include <gnome-autoar/autoar.h>
 #include <tp-account-widgets/tpaw-live-search.h>
 #include <tp-account-widgets/tpaw-pixbuf-utils.h>
 #include <tp-account-widgets/tpaw-utils.h>
@@ -46,6 +47,8 @@
 
 #define DEBUG_FLAG EMPATHY_DEBUG_OTHER
 #include "empathy-debug.h"
+
+#define EMPATHY_RESPONSE_SEND 1
 
 void
 empathy_gtk_init (void)
@@ -762,7 +765,7 @@ file_manager_send_file_response_cb (GtkDialog *widget,
 {
   GFile *file;
 
-  if (response_id == GTK_RESPONSE_OK)
+  if (response_id == GTK_RESPONSE_OK || response_id == EMPATHY_RESPONSE_SEND)
     {
       file = gtk_file_chooser_get_file (GTK_FILE_CHOOSER (widget));
 
@@ -802,13 +805,21 @@ empathy_send_file_with_file_chooser (EmpathyContact *contact)
   GtkWidget *widget;
   GtkWidget *button;
 
+  GtkWidget *extra;
+  GtkWidget *format_label;
+  GtkWidget *format_combo;
+
+  GSettings *settings;
+  AutoarPref *arpref;
+
   g_return_if_fail (EMPATHY_IS_CONTACT (contact));
 
   DEBUG ("Creating selection file chooser");
 
   widget = gtk_file_chooser_dialog_new (_("Select a file"), NULL,
       GTK_FILE_CHOOSER_ACTION_OPEN,
-      GTK_STOCK_CANCEL, GTK_RESPONSE_CANCEL,
+	  _("OK"), GTK_RESPONSE_OK,
+      _("Cancel"), GTK_RESPONSE_CANCEL,
       NULL);
 
   /* send button */
@@ -819,11 +830,11 @@ empathy_send_file_with_file_chooser (EmpathyContact *contact)
   gtk_widget_show (button);
 
   gtk_dialog_add_action_widget (GTK_DIALOG (widget), button,
-      GTK_RESPONSE_OK);
+      EMPATHY_RESPONSE_SEND);
 
   gtk_widget_set_can_default (button, TRUE);
   gtk_dialog_set_default_response (GTK_DIALOG (widget),
-      GTK_RESPONSE_OK);
+      EMPATHY_RESPONSE_SEND);
 
   gtk_file_chooser_set_local_only (GTK_FILE_CHOOSER (widget), FALSE);
 
@@ -832,6 +843,20 @@ empathy_send_file_with_file_chooser (EmpathyContact *contact)
 
   gtk_file_chooser_add_filter (GTK_FILE_CHOOSER (widget),
       create_file_filter ());
+
+  settings = g_settings_new (AUTOAR_PREF_DEFAULT_GSCHEMA_ID);
+  arpref = autoar_pref_new_with_gsettings (settings);
+
+  extra = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 0);
+  format_label = gtk_label_new (
+      _("Archive selected directories using this format: "));
+  format_combo = autoar_gtk_format_filter_simple_new (
+      autoar_pref_get_default_format (arpref),
+      autoar_pref_get_default_filter (arpref));
+  gtk_box_pack_start (GTK_BOX (extra), format_label, FALSE, FALSE, 0);
+  gtk_box_pack_start (GTK_BOX (extra), format_combo, FALSE, FALSE, 0);
+  gtk_widget_show_all (extra);
+  gtk_file_chooser_set_extra_widget (GTK_FILE_CHOOSER (widget), extra);
 
   g_signal_connect (widget, "response",
       G_CALLBACK (file_manager_send_file_response_cb), g_object_ref (contact));

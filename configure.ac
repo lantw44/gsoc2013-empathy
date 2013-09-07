@@ -230,6 +230,7 @@ PKG_CHECK_MODULES(EMPATHY,
    webkitgtk-3.0 >= $WEBKIT_REQUIRED
    libsoup-2.4
    gee-0.8
+   gnome-autoar
 ])
 
 # -----------------------------------------------------------
