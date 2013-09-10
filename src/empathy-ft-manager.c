@@ -31,6 +31,7 @@
 #include "empathy-ft-manager.h"
 
 #include <glib/gi18n.h>
+#include <gnome-autoar/autoar.h>
 #include <tp-account-widgets/tpaw-builder.h>
 
 #include "empathy-geometry.h"
@@ -456,6 +457,110 @@ ft_handler_transfer_error_cb (EmpathyFTHandler *handler,
   g_free (message);
 }
 
+/* Forward decl */
+static void do_real_transfer_done (EmpathyFTManager *manager,
+                                   EmpathyFTHandler *handler);
+
+typedef struct {
+  EmpathyFTHandler *handler;
+  EmpathyFTManager *manager;
+  GtkTreeRowReference *row_ref;
+} FTData;
+
+static void
+ftdata_free (FTData *ftdata)
+{
+  g_object_set_data (G_OBJECT (ftdata->handler), "autoar-cancellable", NULL);
+  g_object_unref (ftdata->manager);
+  g_object_unref (ftdata->handler);
+  gtk_tree_row_reference_free (ftdata->row_ref);
+  g_free (ftdata);
+}
+
+static void
+transfer_done_autoar_decide_dest_cb (AutoarExtract *arextract,
+                                     GFile *destination,
+                                     FTData *ftdata)
+{
+  /* XXX Steal the GFile */
+  g_object_unref (empathy_ft_handler_get_gfile (ftdata->handler));
+  g_object_set (ftdata->handler, "gfile", destination, NULL);
+}
+
+static void
+transfer_done_autoar_progress_cb (AutoarExtract *arextract,
+                                  gdouble fraction_size,
+                                  gdouble fraction_files,
+                                  FTData *ftdata)
+{
+  EmpathyFTManager *manager;
+  GtkTreeRowReference *row_ref;
+  char *first_line, *second_line;
+  char *message;
+  int percentage;
+
+  first_line = g_strdup_printf (_("Extracting received file \"%s\""),
+      empathy_ft_handler_get_filename (ftdata->handler));
+  second_line = ft_manager_format_progress_bytes_and_percentage (
+      autoar_extract_get_completed_size (arextract),
+      autoar_extract_get_size (arextract), -1.0, &percentage);
+
+  message = g_strdup_printf ("%s\n%s", first_line, second_line);
+
+  manager = ftdata->manager;
+  row_ref = ftdata->row_ref;
+  ft_manager_update_handler_message (manager, row_ref, message);
+  ft_manager_update_handler_progress (manager, row_ref, percentage);
+
+  g_free (message);
+  g_free (first_line);
+  g_free (second_line);
+}
+
+static void
+transfer_done_autoar_cancelled_cb (AutoarExtract *arextract,
+                                   FTData *ftdata)
+{
+  /* XXX Steal the GFile */
+  g_object_unref (empathy_ft_handler_get_gfile (ftdata->handler));
+  g_object_set (ftdata->handler, "gfile",
+      autoar_extract_get_source_file (arextract), NULL);
+  g_object_set_data (G_OBJECT (ftdata->handler), "autoar-pref", NULL);
+  ft_manager_update_handler_progress (ftdata->manager, ftdata->row_ref, 100);
+  do_real_transfer_done (ftdata->manager, ftdata->handler);
+  ftdata_free (ftdata);
+}
+
+static void
+transfer_done_autoar_completed_cb (AutoarExtract *arextract,
+                                   FTData *ftdata)
+{
+  g_object_set_data (G_OBJECT (ftdata->handler), "autoar-pref", NULL);
+  do_real_transfer_done (ftdata->manager, ftdata->handler);
+  ftdata_free (ftdata);
+}
+
+static void
+trasnfer_done_autoar_error_cb (AutoarExtract *arextract,
+                               GError *error,
+                               FTData *ftdata)
+{
+  GtkWidget *error_dialog;
+
+  error_dialog = gtk_message_dialog_new_with_markup (
+      NULL, GTK_DIALOG_DESTROY_WITH_PARENT,
+      GTK_MESSAGE_ERROR, GTK_BUTTONS_CLOSE,
+      "<big><b>%s</b></big>",
+      autoar_extract_get_source (arextract));
+  gtk_message_dialog_format_secondary_text (
+      GTK_MESSAGE_DIALOG (error_dialog), "%s", error->message);
+  gtk_widget_show_all (error_dialog);
+  g_signal_connect_swapped (error_dialog, "response",
+      G_CALLBACK (gtk_widget_destroy), error_dialog);
+
+  transfer_done_autoar_cancelled_cb (arextract, ftdata);
+}
+
 static void
 do_real_transfer_done (EmpathyFTManager *manager,
                        EmpathyFTHandler *handler)
@@ -467,12 +572,16 @@ do_real_transfer_done (EmpathyFTManager *manager,
   gboolean incoming;
   GtkTreeRowReference *row_ref;
   GtkRecentManager *recent_manager;
-  GFile *file;
+  GFile *file, *dir;
+  AutoarPref *arpref;
+  AutoarExtract *arextract;
 
   row_ref = ft_manager_get_row_from_handler (manager, handler);
   g_return_if_fail (row_ref != NULL);
 
   incoming = empathy_ft_handler_is_incoming (handler);
+  arpref = g_object_get_data (G_OBJECT (handler), "autoar-pref");
+  file = empathy_ft_handler_get_gfile (handler);
   contact_name = empathy_contact_get_alias
     (empathy_ft_handler_get_contact (handler));
   filename = empathy_ft_handler_get_filename (handler);
@@ -488,6 +597,53 @@ do_real_transfer_done (EmpathyFTManager *manager,
     first_line = g_strdup_printf (_("\"%s\" sent to %s"), filename,
         contact_name);
 
+  if (incoming && arpref != NULL)
+    {
+      FTData *ftdata;
+      GCancellable *cancellable;
+
+      dir = g_file_get_parent (file);
+      if (dir == NULL)
+        dir = g_file_new_for_path ("/");
+
+      arextract = autoar_extract_new_file (file, dir, arpref);
+      ftdata = g_new (FTData, 1);
+      ftdata->handler = g_object_ref (handler);
+      ftdata->manager = g_object_ref (manager);
+      ftdata->row_ref = gtk_tree_row_reference_copy (row_ref);
+
+      cancellable = g_cancellable_new ();
+      g_object_set_data_full (G_OBJECT (handler), "autoar-cancellable",
+          g_object_ref (cancellable), g_object_unref);
+
+      g_signal_connect (arextract, "decide_dest",
+          G_CALLBACK (transfer_done_autoar_decide_dest_cb), ftdata);
+      g_signal_connect (arextract, "progress",
+          G_CALLBACK (transfer_done_autoar_progress_cb), ftdata);
+      g_signal_connect (arextract, "cancelled",
+          G_CALLBACK (transfer_done_autoar_cancelled_cb), ftdata);
+      g_signal_connect (arextract, "completed",
+          G_CALLBACK (transfer_done_autoar_completed_cb), ftdata);
+      g_signal_connect (arextract, "error",
+          G_CALLBACK (trasnfer_done_autoar_error_cb), ftdata);
+      autoar_extract_start_async (arextract, cancellable);
+
+      second_line = _("Preparing for extraction…");
+      message = g_strdup_printf ("%s\n%s", first_line, second_line);
+
+      ft_manager_update_handler_message (ftdata->manager, ftdata->row_ref,
+          message);
+      ft_manager_update_handler_progress (ftdata->manager, ftdata->row_ref, 0);
+
+      g_free (first_line);
+      g_free (message);
+
+      g_object_unref (cancellable);
+      g_object_unref (arextract);
+      g_object_unref (dir);
+      return;
+    }
+
   second_line = g_strdup (_("File transfer completed"));
 
   message = g_strdup_printf ("%s\n%s", first_line, second_line);
@@ -502,7 +658,6 @@ do_real_transfer_done (EmpathyFTManager *manager,
   g_free (second_line);
 
   recent_manager = gtk_recent_manager_get_default ();
-  file = empathy_ft_handler_get_gfile (handler);
   uri = g_file_get_uri (file);
 
   gtk_recent_manager_add_item (recent_manager, uri);
@@ -835,6 +990,7 @@ ft_manager_open (EmpathyFTManager *manager)
 static void
 ft_manager_stop (EmpathyFTManager *manager)
 {
+  GCancellable *cancellable;
   GtkTreeSelection *selection;
   GtkTreeIter iter;
   GtkTreeModel *model;
@@ -855,7 +1011,11 @@ ft_manager_stop (EmpathyFTManager *manager)
       empathy_contact_get_alias (empathy_ft_handler_get_contact (handler)),
       empathy_ft_handler_get_filename (handler));
 
-  empathy_ft_handler_cancel_transfer (handler);
+  cancellable = g_object_get_data (G_OBJECT (handler), "autoar-cancellable");
+  if (cancellable != NULL)
+    g_cancellable_cancel (cancellable);
+  else
+    empathy_ft_handler_cancel_transfer (handler);
 
   g_object_unref (handler);
 }
