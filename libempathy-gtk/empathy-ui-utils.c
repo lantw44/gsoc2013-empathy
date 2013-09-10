@@ -1128,6 +1128,9 @@ file_manager_receive_file_response_cb (GtkDialog *dialog,
       guint64 free_space, file_size;
       GError *error = NULL;
 
+      GtkToggleButton *extract_yes;
+      GtkToggleButton *extract_delete;
+
       file = gtk_file_chooser_get_file (GTK_FILE_CHOOSER (dialog));
       parent = g_file_get_parent (file);
       info = g_file_query_filesystem_info (parent,
@@ -1178,6 +1181,19 @@ file_manager_receive_file_response_cb (GtkDialog *dialog,
           return;
         }
 
+      extract_yes = g_object_get_data (G_OBJECT (dialog), "extract-yes");
+      extract_delete = g_object_get_data (G_OBJECT (dialog), "extract-delete");
+      if (!gtk_toggle_button_get_active (extract_yes))
+        {
+          g_object_set_data (G_OBJECT (handler), "autoar-pref", NULL);
+        }
+      else
+        {
+          autoar_pref_set_delete_if_succeed (
+              g_object_get_data (G_OBJECT (handler), "autoar-pref"),
+              gtk_toggle_button_get_active (extract_delete));
+        }
+
       factory = empathy_ft_factory_dup_singleton ();
 
       empathy_ft_factory_set_destination_for_incoming_handler (
@@ -1201,9 +1217,18 @@ void
 empathy_receive_file_with_file_chooser (EmpathyFTHandler *handler)
 {
   GtkWidget *widget;
-  const gchar *dir;
+  const gchar *dir, *filename;
   EmpathyContact *contact;
   gchar *title;
+
+  GtkWidget *extra;
+  GtkWidget *extract_yes;
+  GtkWidget *extract_delete;
+
+  GSettings *settings;
+  AutoarPref *arpref;
+  const gchar *content_type;
+  gchar *mime_type;
 
   contact = empathy_ft_handler_get_contact (handler);
   g_assert (contact != NULL);
@@ -1218,7 +1243,7 @@ empathy_receive_file_with_file_chooser (EmpathyFTHandler *handler)
       NULL);
 
   gtk_file_chooser_set_current_name (GTK_FILE_CHOOSER (widget),
-    empathy_ft_handler_get_filename (handler));
+    filename = empathy_ft_handler_get_filename (handler));
 
   gtk_file_chooser_set_do_overwrite_confirmation
     (GTK_FILE_CHOOSER (widget), TRUE);
@@ -1230,11 +1255,44 @@ empathy_receive_file_with_file_chooser (EmpathyFTHandler *handler)
 
   gtk_file_chooser_set_current_folder (GTK_FILE_CHOOSER (widget), dir);
 
+  extra = gtk_box_new (GTK_ORIENTATION_VERTICAL, 0);
+  extract_yes = gtk_check_button_new_with_mnemonic (
+     _("E_xtract files from the incoming file if it is an archive"));
+  extract_delete = gtk_check_button_new_with_mnemonic (
+     _("_Delete the saved incoming file after the extraction is completed"));
+  gtk_box_pack_start (GTK_BOX (extra), extract_yes, FALSE, FALSE, 0);
+  gtk_box_pack_start (GTK_BOX (extra), extract_delete, FALSE, FALSE, 0);
+
+  settings = g_settings_new (AUTOAR_PREF_DEFAULT_GSCHEMA_ID);
+  arpref = autoar_pref_new_with_gsettings (settings);
+  content_type = empathy_ft_handler_get_content_type (handler);
+  mime_type = g_content_type_get_mime_type (content_type);
+
+  gtk_toggle_button_set_active (GTK_TOGGLE_BUTTON (extract_yes),
+      autoar_pref_check_file_name (arpref, filename) ||
+      autoar_pref_check_mime_type_d (arpref, mime_type));
+  gtk_toggle_button_set_active (GTK_TOGGLE_BUTTON (extract_delete),
+      autoar_pref_get_delete_if_succeed (arpref));
+  g_object_bind_property (extract_yes, "active",
+      extract_delete, "sensitive", G_BINDING_SYNC_CREATE);
+
+  gtk_widget_show_all (extra);
+  gtk_file_chooser_set_extra_widget (GTK_FILE_CHOOSER (widget), extra);
+
   g_signal_connect (widget, "response",
       G_CALLBACK (file_manager_receive_file_response_cb), handler);
+  g_object_set_data_full (G_OBJECT (handler), "autoar-pref",
+      g_object_ref (arpref), g_object_unref);
+  g_object_set_data_full (G_OBJECT (widget), "extract-yes",
+      g_object_ref (extract_yes), g_object_unref);
+  g_object_set_data_full (G_OBJECT (widget), "extract-delete",
+      g_object_ref (extract_delete), g_object_unref);
 
   gtk_widget_show (widget);
   g_free (title);
+  g_object_unref (settings);
+  g_object_unref (arpref);
+  g_free (mime_type);
 }
 
 void
